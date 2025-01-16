@@ -189,22 +189,20 @@
   <script src="random-websim-generator.js"></script>
   
   <script>
-    // Update peer list with queried status
+    // Update peer list
     function updatePeerList() {
       const peerList = document.getElementById('peerList');
       peerList.innerHTML = '';
       
       for (const clientId in room.party.peers) {
         const peer = room.party.peers[clientId];
-        const isQueried = queriedUsernames.has(peer.username);
         const peerElement = document.createElement('div');
         peerElement.className = 'peer';
-        peerElement.style.opacity = isQueried ? '0.7' : '1';
         peerElement.innerHTML = `
           <img src="https://images.websim.ai/avatar/${peer.username}" 
                alt="${peer.username}"
                onerror="this.style.display='none'">
-          <span>@${peer.username}${isQueried ? ' ✓' : ''}</span>
+          <span>@${peer.username}</span>
         `;
         peerList.appendChild(peerElement);
       }

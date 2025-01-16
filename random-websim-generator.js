@@ -1,47 +1,29 @@
 let currentUser = null;
 const room = new WebsimSocket();
-let discoveredSources = new Set();
-let queriedUsernames = new Set();
-let discoveredUsernames = new Set();
+let discoveredUrls = new Set();
 let lastQueryTime = 0;
 const QUERY_COOLDOWN = 2000; // 2 seconds cooldown between queries
 
 // Initialize from database
 async function initializeFromDatabase() {
-  // Load discovered sources
-  const sources = await room.collection('discovered_source').getList();
-  sources.forEach(record => {
-    discoveredSources.add(record.sourceKey);
-  });
-
-  // Load queried usernames
-  const queried = await room.collection('queried_username').getList();
-  queried.forEach(record => {
-    queriedUsernames.add(record.username);
-  });
-
-  // Load discovered usernames
-  const discovered = await room.collection('discovered_username').getList();
-  discovered.forEach(record => {
-    discoveredUsernames.add(record.username);
-  });
-
+  const urlRecords = await room.collection('websim_urls').getList();
+  if (urlRecords.length > 0) {
+    discoveredUrls = new Set(JSON.parse(urlRecords[0].urls || '[]'));
+  } else {
+    // Create initial empty record if none exists
+    await room.collection('websim_urls').create({
+      urls: '[]'
+    });
+  }
   updateSourceCount();
 }
 
 // Subscribe to database changes
-room.collection('discovered_source').subscribe((sources) => {
-  discoveredSources = new Set(sources.map(s => s.sourceKey));
-  updateSourceCount();
-});
-
-room.collection('queried_username').subscribe((queried) => {
-  queriedUsernames = new Set(queried.map(q => q.username)); 
-  updateSourceCount();
-});
-
-room.collection('discovered_username').subscribe((discovered) => {
-  discoveredUsernames = new Set(discovered.map(d => d.username));
+room.collection('websim_urls').subscribe((records) => {
+  if (records.length > 0) {
+    discoveredUrls = new Set(JSON.parse(records[0].urls || '[]'));
+    updateSourceCount();
+  }
 });
 
 async function getCurrentUser() {
@@ -56,55 +38,21 @@ async function getCurrentUser() {
   return currentUser;
 }
 
-// Store a discovered source in the database
-async function storeDiscoveredSource(source) {
-  const sourceKey = JSON.stringify({
-    site: source.site,
-    project: source.project,
-    cursor: source.cursor
-  });
-  
-  if (!discoveredSources.has(sourceKey)) {
+// Store a URL in the database
+async function storeUrl(url) {
+  if (!discoveredUrls.has(url)) {
     try {
-      await room.collection('discovered_source').create({
-        sourceKey: sourceKey,
-        timestamp: new Date().toISOString()
+      const records = await room.collection('websim_urls').getList();
+      const record = records[0];
+      const urls = new Set(JSON.parse(record.urls || '[]'));
+      urls.add(url);
+      await room.collection('websim_urls').update(record.id, {
+        urls: JSON.stringify([...urls])
       });
-      discoveredSources.add(sourceKey);
+      discoveredUrls.add(url);
       updateSourceCount();
     } catch (error) {
-      console.error('Error storing discovered source:', error);
-    }
-  }
-}
-
-// Store a queried username in the database
-async function storeQueriedUsername(username) {
-  if (!queriedUsernames.has(username)) {
-    try {
-      await room.collection('queried_username').create({
-        username: username,
-        timestamp: new Date().toISOString()
-      });
-      queriedUsernames.add(username);
-      updateSourceCount();
-    } catch (error) {
-      console.error('Error storing queried username:', error);
-    }
-  }
-}
-
-// Store a discovered username in the database
-async function storeDiscoveredUsername(username) {
-  if (!discoveredUsernames.has(username)) {
-    try {
-      await room.collection('discovered_username').create({
-        username: username,
-        timestamp: new Date().toISOString()
-      });
-      discoveredUsernames.add(username);
-    } catch (error) {
-      console.error('Error storing discovered username:', error);
+      console.error('Error storing URL:', error);
     }
   }
 }
@@ -129,8 +77,7 @@ async function fetchWithPagination(url, params = {}) {
 }
 
 async function fetchUserFeeds(username, depth = 2) {
-  if (depth <= 0 || queriedUsernames.has(username)) return;
-  await storeQueriedUsername(username);
+  if (depth <= 0) return;
 
   try {
     const userFeed = await fetchWithPagination(`/api/v1/users/${username}/feed`);
@@ -138,16 +85,14 @@ async function fetchUserFeeds(username, depth = 2) {
 
     const followers = await fetchWithPagination(`/api/v1/users/${username}/followers`);
     for (const {follow} of (followers.followers?.data || []).slice(0, 3)) {
-      if (follow?.user?.username && !queriedUsernames.has(follow.user.username)) {
-        await storeDiscoveredUsername(follow.user.username);
+      if (follow?.user?.username) {
         await fetchUserFeeds(follow.user.username, depth - 1);
       }
     }
 
     const following = await fetchWithPagination(`/api/v1/users/${username}/following`);
     for (const {follow} of (following.following?.data || []).slice(0, 3)) {
-      if (follow?.user?.username && !queriedUsernames.has(follow.user.username)) {
-        await storeDiscoveredUsername(follow.user.username);
+      if (follow?.user?.username) {
         await fetchUserFeeds(follow.user.username, depth - 1);
       }
     }
@@ -159,8 +104,9 @@ async function fetchUserFeeds(username, depth = 2) {
 async function addSources(items) {
   if (Array.isArray(items)) {
     for (const item of items) {
-      if (item?.site && item?.project) {
-        await storeDiscoveredSource(item);
+      if (item?.site?.id) {
+        const url = `https://websim.ai/c/${item.site.id}`;
+        await storeUrl(url);
       }
     }
   }
@@ -169,7 +115,7 @@ async function addSources(items) {
 function updateSourceCount() {
   const countElement = document.getElementById('sourceCount');
   if (countElement) {
-    countElement.textContent = `${discoveredSources.size} (${queriedUsernames.size} users queried)`;
+    countElement.textContent = discoveredUrls.size;
   }
 }
 
@@ -178,18 +124,18 @@ async function getAllSources() {
   const now = Date.now();
   
   if (now - lastQueryTime < QUERY_COOLDOWN) {
-    return Array.from(discoveredSources).map(s => JSON.parse(s));
+    return Array.from(discoveredUrls);
   }
   
   lastQueryTime = now;
 
   try {
-    if (discoveredSources.size < 100) {
+    if (discoveredUrls.size < 100) {
       const trending = await fetchWithPagination('/api/v1/feed/trending');
       await addSources(trending.feed?.data);
     }
 
-    if (user && !queriedUsernames.has(user.username)) {
+    if (user) {
       const userFeed = await fetchWithPagination('/api/v1/user/feed');
       await addSources(userFeed.feed?.data);
 
@@ -202,19 +148,11 @@ async function getAllSources() {
       await fetchUserFeeds(user.username);
     }
 
-    for (const username of discoveredUsernames) {
-      if (!queriedUsernames.has(username)) {
-        const userProjects = await fetchWithPagination(`/api/v1/users/${username}/projects`);
-        await addSources(userProjects.projects?.data);
-        await storeQueriedUsername(username);
-      }
-    }
-
   } catch (error) {
     console.error('Error fetching sources:', error);
   }
 
-  return Array.from(discoveredSources).map(s => JSON.parse(s));
+  return Array.from(discoveredUrls);
 }
 
 function shuffleArray(array) {
@@ -226,36 +164,46 @@ function shuffleArray(array) {
   return newArray;
 }
 
-function createWebSimCard(item) {
-  if (!item?.site || !item?.project) return null;
+function createWebSimCard(url) {
+  const match = url.match(/\/c\/([a-zA-Z0-9]+)/);
+  if (!match) return null;
   
-  const { site, project } = item;
+  const siteId = match[1];
   
   const card = document.createElement('div');
   card.className = 'websim-card';
   
-  const imageUrl = `https://images.websim.ai/v1/site/${site.id}/600`;
-  const siteUrl = `https://websim.ai/c/${site.id}`;
-  const creatorUrl = site.owner?.username ? `https://websim.ai/@${site.owner.username}` : '#';
-  const avatarUrl = site.owner?.username ? `https://images.websim.ai/avatar/${site.owner.username}` : '';
-  const title = site.title || project.title || 'Untitled WebSim';
-  const username = site.owner?.username || 'Anonymous';
+  const imageUrl = `https://images.websim.ai/v1/site/${siteId}/600`;
 
   card.innerHTML = `
-    <a href="${siteUrl}" target="_blank" class="card-link">
+    <a href="${url}" target="_blank" class="card-link">
       <div class="image-container">
-        <img class="websim-image" src="${imageUrl}" alt="${title}" 
+        <img class="websim-image" src="${imageUrl}" alt="WebSim Preview" 
              onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 1 1%22><rect width=%221%22 height=%221%22 fill=%22%23eee%22/></svg>'">
       </div>
-      <div class="websim-info">
+    </a>
+  `;
+
+  // Fetch site details asynchronously
+  fetch(`/api/v1/sites/${siteId}`).then(async response => {
+    if (response.ok) {
+      const data = await response.json();
+      const title = data.site?.title || data.project?.title || 'Untitled WebSim';
+      const username = data.site?.owner?.username || 'Anonymous';
+      const avatarUrl = username ? `https://images.websim.ai/avatar/${username}` : '';
+      
+      const infoDiv = document.createElement('div');
+      infoDiv.className = 'websim-info';
+      infoDiv.innerHTML = `
         <h3 class="websim-title">${title}</h3>
         <div class="websim-creator">
           ${avatarUrl ? `<img class="creator-avatar" src="${avatarUrl}" alt="${username}" onerror="this.style.display='none'">` : ''}
           <span>@${username}</span>
         </div>
-      </div>
-    </a>
-  `;
+      `;
+      card.appendChild(infoDiv);
+    }
+  }).catch(console.error);
 
   return card;
 }
@@ -269,12 +217,12 @@ async function generateRandomWebSims() {
   button.textContent = 'Loading...';
 
   try {
-    const sources = await getAllSources();
-    const randomSources = shuffleArray(sources).slice(0, 12);
+    const urls = await getAllSources();
+    const randomUrls = shuffleArray(urls).slice(0, 12);
     
     websimList.innerHTML = '';
-    randomSources.forEach(item => {
-      const card = createWebSimCard(item);
+    randomUrls.forEach(url => {
+      const card = createWebSimCard(url);
       if (card) websimList.appendChild(card);
     });
 
