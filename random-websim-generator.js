@@ -1,13 +1,48 @@
 let currentUser = null;
 const room = new WebsimSocket();
-const discoveredSources = new Set();
-const queriedUsernames = new Set(); // Track usernames we've already queried
-const discoveredUsernames = new Set();
+let discoveredSources = new Set();
+let queriedUsernames = new Set();
+let discoveredUsernames = new Set();
 let lastQueryTime = 0;
 const QUERY_COOLDOWN = 2000; // 2 seconds cooldown between queries
 
-// Store usernames we discover through multiplayer
-// const discoveredUsernames = new Set();
+// Initialize from database
+async function initializeFromDatabase() {
+  // Load discovered sources
+  const sources = await room.collection('discovered_source').getList();
+  sources.forEach(record => {
+    discoveredSources.add(record.sourceKey);
+  });
+
+  // Load queried usernames
+  const queried = await room.collection('queried_username').getList();
+  queried.forEach(record => {
+    queriedUsernames.add(record.username);
+  });
+
+  // Load discovered usernames
+  const discovered = await room.collection('discovered_username').getList();
+  discovered.forEach(record => {
+    discoveredUsernames.add(record.username);
+  });
+
+  updateSourceCount();
+}
+
+// Subscribe to database changes
+room.collection('discovered_source').subscribe((sources) => {
+  discoveredSources = new Set(sources.map(s => s.sourceKey));
+  updateSourceCount();
+});
+
+room.collection('queried_username').subscribe((queried) => {
+  queriedUsernames = new Set(queried.map(q => q.username)); 
+  updateSourceCount();
+});
+
+room.collection('discovered_username').subscribe((discovered) => {
+  discoveredUsernames = new Set(discovered.map(d => d.username));
+});
 
 async function getCurrentUser() {
   if (!currentUser) {
@@ -21,44 +56,64 @@ async function getCurrentUser() {
   return currentUser;
 }
 
-// Share sources with other users
-room.onmessage = (event) => {
-  const data = event.data;
-  if (data.type === 'share_sources') {
-    data.sources.forEach(source => {
-      discoveredSources.add(JSON.stringify(source));
-    });
-    updateSourceCount();
-  } else if (data.type === 'share_username') {
-    const username = data.username;
-    if (!queriedUsernames.has(username)) {
-      discoveredUsernames.add(username);
+// Store a discovered source in the database
+async function storeDiscoveredSource(source) {
+  const sourceKey = JSON.stringify({
+    site: source.site,
+    project: source.project,
+    cursor: source.cursor
+  });
+  
+  if (!discoveredSources.has(sourceKey)) {
+    try {
+      await room.collection('discovered_source').create({
+        sourceKey: sourceKey,
+        timestamp: new Date().toISOString()
+      });
+      discoveredSources.add(sourceKey);
+      updateSourceCount();
+    } catch (error) {
+      console.error('Error storing discovered source:', error);
     }
-  }
-};
-
-// Share username when joining or when discovering new ones
-function broadcastUsername(username) {
-  if (username && !queriedUsernames.has(username)) {
-    room.send({
-      type: 'share_username',
-      username: username
-    });
   }
 }
 
-room.party.subscribe((peers) => {
-  const user = room.party.client;
-  if (user.username) {
-    broadcastUsername(user.username);
+// Store a queried username in the database
+async function storeQueriedUsername(username) {
+  if (!queriedUsernames.has(username)) {
+    try {
+      await room.collection('queried_username').create({
+        username: username,
+        timestamp: new Date().toISOString()
+      });
+      queriedUsernames.add(username);
+      updateSourceCount();
+    } catch (error) {
+      console.error('Error storing queried username:', error);
+    }
   }
-});
+}
+
+// Store a discovered username in the database
+async function storeDiscoveredUsername(username) {
+  if (!discoveredUsernames.has(username)) {
+    try {
+      await room.collection('discovered_username').create({
+        username: username,
+        timestamp: new Date().toISOString()
+      });
+      discoveredUsernames.add(username);
+    } catch (error) {
+      console.error('Error storing discovered username:', error);
+    }
+  }
+}
 
 async function fetchWithPagination(url, params = {}) {
   try {
     const queryParams = new URLSearchParams({
       ...params,
-      first: 50 // Increased from 20 to get more results
+      first: 50
     }).toString();
     
     const response = await fetch(`${url}?${queryParams}`);
@@ -75,29 +130,24 @@ async function fetchWithPagination(url, params = {}) {
 
 async function fetchUserFeeds(username, depth = 2) {
   if (depth <= 0 || queriedUsernames.has(username)) return;
-  queriedUsernames.add(username);
+  await storeQueriedUsername(username);
 
   try {
-    // Get user's feed
     const userFeed = await fetchWithPagination(`/api/v1/users/${username}/feed`);
-    addSources(userFeed.feed?.data);
+    await addSources(userFeed.feed?.data);
 
-    // Get user's followers and their feeds
     const followers = await fetchWithPagination(`/api/v1/users/${username}/followers`);
     for (const {follow} of (followers.followers?.data || []).slice(0, 3)) {
       if (follow?.user?.username && !queriedUsernames.has(follow.user.username)) {
-        discoveredUsernames.add(follow.user.username);
-        broadcastUsername(follow.user.username);
+        await storeDiscoveredUsername(follow.user.username);
         await fetchUserFeeds(follow.user.username, depth - 1);
       }
     }
 
-    // Get user's following and their feeds
     const following = await fetchWithPagination(`/api/v1/users/${username}/following`);
     for (const {follow} of (following.following?.data || []).slice(0, 3)) {
       if (follow?.user?.username && !queriedUsernames.has(follow.user.username)) {
-        discoveredUsernames.add(follow.user.username);
-        broadcastUsername(follow.user.username);
+        await storeDiscoveredUsername(follow.user.username);
         await fetchUserFeeds(follow.user.username, depth - 1);
       }
     }
@@ -106,37 +156,13 @@ async function fetchUserFeeds(username, depth = 2) {
   }
 }
 
-function addSources(items) {
-  let addedCount = 0;
+async function addSources(items) {
   if (Array.isArray(items)) {
-    items.forEach(item => {
+    for (const item of items) {
       if (item?.site && item?.project) {
-        const sourceKey = JSON.stringify({
-          site: item.site,
-          project: item.project,
-          cursor: item.cursor
-        });
-        if (!discoveredSources.has(sourceKey)) {
-          discoveredSources.add(sourceKey);
-          addedCount++;
-        }
+        await storeDiscoveredSource(item);
       }
-    });
-    if (addedCount > 0) {
-      updateSourceCount();
-      // Share only new sources
-      broadcastSources(items.slice(-addedCount));
     }
-  }
-}
-
-// Share only new sources with other users
-function broadcastSources(sources) {
-  if (sources && sources.length > 0) {
-    room.send({
-      type: 'share_sources',
-      sources: sources.slice(0, 50)
-    });
   }
 }
 
@@ -158,34 +184,29 @@ async function getAllSources() {
   lastQueryTime = now;
 
   try {
-    // Only query trending if we haven't discovered many sources yet
     if (discoveredSources.size < 100) {
       const trending = await fetchWithPagination('/api/v1/feed/trending');
-      addSources(trending.feed?.data);
+      await addSources(trending.feed?.data);
     }
 
     if (user && !queriedUsernames.has(user.username)) {
-      // Get user's own feeds
       const userFeed = await fetchWithPagination('/api/v1/user/feed');
-      addSources(userFeed.feed?.data);
+      await addSources(userFeed.feed?.data);
 
-      // Get user's likes and projects
       const likes = await fetchWithPagination(`/api/v1/users/${user.username}/likes`);
-      addSources(likes.likes?.data);
+      await addSources(likes.likes?.data);
 
       const projects = await fetchWithPagination(`/api/v1/users/${user.username}/projects`);
-      addSources(projects.projects?.data);
+      await addSources(projects.projects?.data);
 
-      // Recursively fetch feeds from user's network
       await fetchUserFeeds(user.username);
     }
 
-    // Query discovered but unqueried usernames
     for (const username of discoveredUsernames) {
       if (!queriedUsernames.has(username)) {
         const userProjects = await fetchWithPagination(`/api/v1/users/${username}/projects`);
-        addSources(userProjects.projects?.data);
-        queriedUsernames.add(username);
+        await addSources(userProjects.projects?.data);
+        await storeQueriedUsername(username);
       }
     }
 
@@ -193,9 +214,7 @@ async function getAllSources() {
     console.error('Error fetching sources:', error);
   }
 
-  const sources = Array.from(discoveredSources).map(s => JSON.parse(s));
-  broadcastSources(sources);
-  return sources;
+  return Array.from(discoveredSources).map(s => JSON.parse(s));
 }
 
 function shuffleArray(array) {
@@ -271,5 +290,7 @@ async function generateRandomWebSims() {
   }
 }
 
-// Generate initial set on page load
-generateRandomWebSims();
+// Initialize database and generate initial set on page load
+initializeFromDatabase().then(() => {
+  generateRandomWebSims();
+});
