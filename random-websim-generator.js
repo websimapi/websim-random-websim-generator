@@ -1,4 +1,11 @@
 let currentUser = null;
+const room = new WebsimSocket();
+const discoveredSources = new Set();
+let lastQueryTime = 0;
+const QUERY_COOLDOWN = 2000; // 2 seconds cooldown between queries
+
+// Store usernames we discover through multiplayer
+const discoveredUsernames = new Set();
 
 async function getCurrentUser() {
   if (!currentUser) {
@@ -12,11 +19,45 @@ async function getCurrentUser() {
   return currentUser;
 }
 
+// Share sources with other users
+function broadcastSources(sources) {
+  if (sources && sources.length > 0) {
+    room.send({
+      type: 'share_sources',
+      sources: sources.slice(0, 50) // Limit to prevent message size issues
+    });
+  }
+}
+
+// Handle incoming shared sources
+room.onmessage = (event) => {
+  const data = event.data;
+  if (data.type === 'share_sources') {
+    data.sources.forEach(source => {
+      discoveredSources.add(JSON.stringify(source));
+    });
+    updateSourceCount();
+  } else if (data.type === 'share_username') {
+    discoveredUsernames.add(data.username);
+  }
+};
+
+// Share username when joining
+room.party.subscribe((peers) => {
+  const user = room.party.client;
+  if (user.username) {
+    room.send({
+      type: 'share_username',
+      username: user.username
+    });
+  }
+});
+
 async function fetchWithPagination(url, params = {}) {
   try {
     const queryParams = new URLSearchParams({
       ...params,
-      first: 20 
+      first: 50 // Increased from 20 to get more results
     }).toString();
     
     const response = await fetch(`${url}?${queryParams}`);
@@ -31,62 +72,111 @@ async function fetchWithPagination(url, params = {}) {
   }
 }
 
-async function getAllSources() {
-  const user = await getCurrentUser();
-  if (!user) {
-    const trending = await fetchWithPagination('/api/v1/feed/trending');
-    return trending.feed?.data || [];
-  }
-
-  const sources = new Set();
-  const addSources = (items) => {
-    if (Array.isArray(items)) {
-      items.forEach(item => {
-        if (item?.site && item?.project) {
-          sources.add(JSON.stringify({
-            site: item.site,
-            project: item.project,
-            cursor: item.cursor
-          }));
-        }
-      });
-    }
-  };
+async function fetchUserFeeds(username, depth = 2) {
+  if (depth <= 0) return;
 
   try {
+    // Get user's feed
+    const userFeed = await fetchWithPagination(`/api/v1/users/${username}/feed`);
+    addSources(userFeed.feed?.data);
+
+    // Get user's followers and their feeds
+    const followers = await fetchWithPagination(`/api/v1/users/${username}/followers`);
+    for (const {follow} of (followers.followers?.data || []).slice(0, 3)) {
+      if (follow?.user?.username) {
+        discoveredUsernames.add(follow.user.username);
+        room.send({
+          type: 'share_username',
+          username: follow.user.username
+        });
+        await fetchUserFeeds(follow.user.username, depth - 1);
+      }
+    }
+
+    // Get user's following and their feeds
+    const following = await fetchWithPagination(`/api/v1/users/${username}/following`);
+    for (const {follow} of (following.following?.data || []).slice(0, 3)) {
+      if (follow?.user?.username) {
+        discoveredUsernames.add(follow.user.username);
+        room.send({
+          type: 'share_username',
+          username: follow.user.username
+        });
+        await fetchUserFeeds(follow.user.username, depth - 1);
+      }
+    }
+  } catch (error) {
+    console.error(`Error fetching feeds for ${username}:`, error);
+  }
+}
+
+function addSources(items) {
+  if (Array.isArray(items)) {
+    items.forEach(item => {
+      if (item?.site && item?.project) {
+        discoveredSources.add(JSON.stringify({
+          site: item.site,
+          project: item.project,
+          cursor: item.cursor
+        }));
+      }
+    });
+    updateSourceCount();
+  }
+}
+
+function updateSourceCount() {
+  const countElement = document.getElementById('sourceCount');
+  if (countElement) {
+    countElement.textContent = discoveredSources.size;
+  }
+}
+
+async function getAllSources() {
+  const user = await getCurrentUser();
+  const now = Date.now();
+  
+  // Implement cooldown to prevent too frequent updates
+  if (now - lastQueryTime < QUERY_COOLDOWN) {
+    return Array.from(discoveredSources).map(s => JSON.parse(s));
+  }
+  
+  lastQueryTime = now;
+
+  try {
+    // Get trending feeds
     const trending = await fetchWithPagination('/api/v1/feed/trending');
     addSources(trending.feed?.data);
 
-    const userFeed = await fetchWithPagination('/api/v1/user/feed');
-    addSources(userFeed.feed?.data);
+    if (user) {
+      // Get user's own feeds
+      const userFeed = await fetchWithPagination('/api/v1/user/feed');
+      addSources(userFeed.feed?.data);
 
-    const followers = await fetchWithPagination(`/api/v1/users/${user.username}/followers`);
-    for (const {follow} of (followers.followers?.data || []).slice(0, 5)) {
-      if (follow?.user?.username) {
-        const followerFeed = await fetchWithPagination(`/api/v1/users/${follow.user.username}/feed`);
-        addSources(followerFeed.feed?.data);
-      }
+      // Get user's likes and projects
+      const likes = await fetchWithPagination(`/api/v1/users/${user.username}/likes`);
+      addSources(likes.likes?.data);
+
+      const projects = await fetchWithPagination(`/api/v1/users/${user.username}/projects`);
+      addSources(projects.projects?.data);
+
+      // Recursively fetch feeds from user's network
+      await fetchUserFeeds(user.username);
     }
 
-    const following = await fetchWithPagination(`/api/v1/users/${user.username}/following`);
-    for (const {follow} of (following.following?.data || []).slice(0, 5)) {
-      if (follow?.user?.username) {
-        const followingFeed = await fetchWithPagination(`/api/v1/users/${follow.user.username}/feed`);
-        addSources(followingFeed.feed?.data);
-      }
+    // Query discovered usernames
+    for (const username of discoveredUsernames) {
+      const userProjects = await fetchWithPagination(`/api/v1/users/${username}/projects`);
+      addSources(userProjects.projects?.data);
     }
-
-    const likes = await fetchWithPagination(`/api/v1/users/${user.username}/likes`);
-    addSources(likes.likes?.data);
-
-    const projects = await fetchWithPagination(`/api/v1/users/${user.username}/projects`);
-    addSources(projects.projects?.data);
 
   } catch (error) {
     console.error('Error fetching sources:', error);
   }
 
-  return Array.from(sources).map(s => JSON.parse(s));
+  const sources = Array.from(discoveredSources).map(s => JSON.parse(s));
+  broadcastSources(sources);
+  return sources;
 }
 
 function shuffleArray(array) {

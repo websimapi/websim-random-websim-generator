@@ -117,6 +117,45 @@
       grid-column: 1 / -1;
     }
 
+    .stats {
+      margin-bottom: 15px;
+      color: #666;
+      font-size: 14px;
+    }
+    
+    .multiplayer-info {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 15px;
+      padding: 10px;
+      background: #f8f9fa;
+      border-radius: 6px;
+    }
+
+    .peer-list {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .peer {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 8px;
+      background: #fff;
+      border-radius: 12px;
+      border: 1px solid #eee;
+    }
+
+    .peer img {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+    }
+    
     @media (max-width: 600px) {
       body {
         padding: 10px;
@@ -135,11 +174,42 @@
 </head>
 <body>
   <div class="container">
+    <div class="multiplayer-info">
+      <div class="stats">
+        Discovered WebSims: <span id="sourceCount">0</span>
+      </div>
+      <div class="peer-list" id="peerList">
+        <!-- Peers will be added here dynamically -->
+      </div>
+    </div>
     <button class="generate-btn" onclick="generateRandomWebSims()">Generate Random WebSims</button>
     <div id="websimList" class="websim-list"></div>
   </div>
 
   <script src="random-websim-generator.js"></script>
+  
+  <script>
+    // Update peer list
+    function updatePeerList() {
+      const peerList = document.getElementById('peerList');
+      peerList.innerHTML = '';
+      
+      for (const clientId in room.party.peers) {
+        const peer = room.party.peers[clientId];
+        const peerElement = document.createElement('div');
+        peerElement.className = 'peer';
+        peerElement.innerHTML = `
+          <img src="https://images.websim.ai/avatar/${peer.username}" 
+               alt="${peer.username}"
+               onerror="this.style.display='none'">
+          <span>@${peer.username}</span>
+        `;
+        peerList.appendChild(peerElement);
+      }
+    }
+    
+    room.party.subscribe(updatePeerList);
+  </script>
 <script defer src="https://static.cloudflareinsights.com/beacon.min.js/v8c78df7c7c0f484497ecbca7046644da1771523124516" integrity="sha512-8DS7rgIrAmghBFwoOTujcf6D9rXvH8xm8JQ1Ja01h9QX8EzXldiszufYa4IFfKdLUKTTrnSFXLDkUEOTrZQ8Qg==" data-cf-beacon='{"version":"2024.11.0","token":"4c6229722a6346bc8eb5cb0e5eae5d41","server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
 </body>
 </html>
